@@ -27,6 +27,7 @@ namespace Sender
             Console.WriteLine("Working, press ENTER to exit");
             Console.ReadLine();
         }
+
         private static ManualResetEvent wait = new ManualResetEvent(false);
         private static void SendThread(IServiceBus bus)
         {
@@ -38,7 +39,7 @@ namespace Sender
                 var guid = Guid.NewGuid();
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine("Sending command with guid " + guid);
-                bus.Send(new HelloCommand { Guid = Guid.NewGuid(), Message = "Hello", Number = random.Next() }).Register
+                bus.SendWithCallback(new HelloCommand { Guid = Guid.NewGuid(), Message = "Hello", Number = random.Next() }).Register
                     <HelloResponse>(x =>
                                         {
                                             Console.ForegroundColor = ConsoleColor.Red;

@@ -16,8 +16,9 @@ namespace MiniBuss
         void RegisterMessageEndpoint<TCommand>(string targetEndpoint) where TCommand : class;
         void HandleSubscriptionsFor<TEvent>() where TEvent : class;
 
-        ICallback Send(object command);
-        ICallback Send(object command, string correlationId);
+        ICallback SendWithCallback(object command);
+        ICallback SendWithCallback(object command, string correlationId);
+        void Send(object command);
         void Reply(object message, object response);
         void Publish(object @event);
 
@@ -30,15 +31,13 @@ namespace MiniBuss
         string LocalEndpoint { get; set; }
     }
 
-    public class ServiceBus : IServiceBus
+    public partial class ServiceBus : IServiceBus
     {
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, string> ReplyQueues = new ConcurrentDictionary<RuntimeTypeHandle, string>();
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, string> TargetQueues = new ConcurrentDictionary<RuntimeTypeHandle, string>();
-        private static readonly ConcurrentDictionary<Type, object> MessageHandlers = new ConcurrentDictionary<Type, object>();
-        private static readonly List<Subscription> Subscriptions = new List<Subscription>();    //concurrency handled with lock()
-        private static readonly ConcurrentDictionary<string, Type> HandledSubscriptions = new ConcurrentDictionary<string, Type>();
-        private static readonly IDictionary<string, BusAsyncResult> messageIdToAsyncResultLookup = new Dictionary<string, BusAsyncResult>();
-        private static readonly IDictionary<object, string> messagesBeingHandled = new Dictionary<object, string>();
+        private readonly ConcurrentDictionary<RuntimeTypeHandle, string> _replyQueues = new ConcurrentDictionary<RuntimeTypeHandle, string>();
+        private readonly ConcurrentDictionary<RuntimeTypeHandle, string> _targetQueues = new ConcurrentDictionary<RuntimeTypeHandle, string>();
+        private readonly ConcurrentDictionary<Type, object> _messageHandlers = new ConcurrentDictionary<Type, object>();
+        private readonly List<Subscription> _subscriptions = new List<Subscription>();    //concurrency handled with lock()
+        private readonly ConcurrentDictionary<string, Type> _handledSubscriptions = new ConcurrentDictionary<string, Type>();
 
         private MessageQueue _queue;
 
@@ -50,8 +49,6 @@ namespace MiniBuss
         }
 
         private string _localEndpoint;
-
-
         public string LocalEndpoint
         {
             get { return _localEndpoint; }
@@ -73,49 +70,36 @@ namespace MiniBuss
 
         public void RegisterMessageEndpoint<TCommand>(string targetEndpoint) where TCommand : class
         {
-            TargetQueues[typeof(TCommand).TypeHandle] = GetEndpointName(targetEndpoint);
+            _targetQueues[typeof(TCommand).TypeHandle] = GetEndpointName(targetEndpoint);
         }
 
         public void Reply(object message, object response)
         {
-            var rq = ReplyQueues[message.GetType().TypeHandle];
+            var rq = _replyQueues[message.GetType().TypeHandle];
             if (rq == null) throw new InvalidOperationException("Endpoint for replying not found for current message");
             string correlationId = string.Empty;
             lock (messagesBeingHandled)
+            {
                 if (messagesBeingHandled.TryGetValue(message, out correlationId))
                 {
                     messagesBeingHandled.Remove(message);
-                    SendMessage(response, rq, correlationId);
+                    SendMessageWithCallback(response, rq, correlationId);
                 }
-
+            }
         }
 
-        public ICallback Send(object command)
+        public void Send(object command)
         {
-            return Send(command, string.Empty);
+            var targetQueue = _targetQueues[command.GetType().TypeHandle];
+            SendMessage(command, targetQueue);
         }
 
-        public ICallback Send(object command, string correlationId)
-        {
-            var targetQueue = TargetQueues[command.GetType().TypeHandle];
-            return SendMessage(command, targetQueue, correlationId);
-        }
-
-        private ICallback SendMessage(object msg, string targetQueue)
-        {
-            return SendMessage(msg, targetQueue, string.Empty);
-        }
-
-        private ICallback SendMessage(object msg, string targetQueue, string correlationId)
+        private void SendMessage(object msg, string targetQueue)
         {
             var type = msg.GetType();
             if (type.Name == null) throw new Exception("Should not be possible");
 
             var message = new Message { Body = msg, Recoverable = true, Label = type.Name };
-
-            if (!string.IsNullOrEmpty(correlationId))
-                message.CorrelationId = correlationId;
-
             var msgQ = new MessageQueue(targetQueue);
 
             if (LocalEndpoint != null)  //we expect and handle replies, so add a response-queue
@@ -124,52 +108,11 @@ namespace MiniBuss
                 message.ResponseQueue = responseQ;
             }
 
-            if (msgQ.Transactional)
+            using (var tx = new TransactionScope())
             {
-                using (var tx = new TransactionScope())
-                {
-                    msgQ.Send(message, MessageQueueTransactionType.Automatic);
-                    tx.Complete();
-                }
+                msgQ.Send(message, MessageQueueTransactionType.Automatic);
+                tx.Complete();
             }
-            else
-            {
-                msgQ.Send(message);
-            }
-
-            var result = new Callback(message.Id);
-            result.Registered += delegate(object sender, BusAsyncResultEventArgs args)
-            {
-                lock (messageIdToAsyncResultLookup)
-                    messageIdToAsyncResultLookup[args.MessageId] = args.Result;
-            };
-
-            return result;
-        }
-
-        private static bool HandleCorrelatedMessage(string correlationId, object message)
-        {
-            if (string.IsNullOrEmpty(correlationId))
-                return false;
-
-            BusAsyncResult busAsyncResult;
-            Trace.TraceInformation("Handling correlated message");
-            lock (messageIdToAsyncResultLookup)
-            {
-                messageIdToAsyncResultLookup.TryGetValue(correlationId, out busAsyncResult);
-                messageIdToAsyncResultLookup.Remove(correlationId);
-            }
-
-            if (message == null) throw new Exception("Could not extract message from msg body - unknown message to us?");
-
-            if (busAsyncResult != null)
-            {
-                if (message != null)
-                    busAsyncResult.Complete(message);
-                var status = busAsyncResult.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5));
-                return status;
-            }
-            return false;
         }
 
         private static void CreateTransactionalQueueIfNotExists(string queueName)
@@ -183,7 +126,7 @@ namespace MiniBuss
             var name = typeof(TCommand).Name;
             if (name == null) throw new InvalidOperationException("Should not happen");
 
-            MessageHandlers[typeof(TCommand)] = CastArgument<object, TCommand>(x => handler(x));
+            _messageHandlers[typeof(TCommand)] = CastArgument<object, TCommand>(x => handler(x));
         }
 
         private static Action<TBase> CastArgument<TBase, TDerived>(Expression<Action<TDerived>> source) where TDerived : TBase
@@ -206,22 +149,16 @@ namespace MiniBuss
                         {
                             MessageReadPropertyFilter = { AppSpecific = true, CorrelationId = true, TransactionId = true }
                         };
-            _queue.ReceiveCompleted += QueueReceiveCompleted;   //NOTE: this whole bit could be removed if we decided to not use non-transactional queues
             _queue.PeekCompleted += QueuePeekCompleted;
-
-            if (_queue.Transactional)
-                _queue.BeginPeek();
-            else
-                _queue.BeginReceive();
+            _queue.BeginPeek();
         }
 
         public void Stop()
         {
-            _queue.ReceiveCompleted -= QueueReceiveCompleted;
             _queue.PeekCompleted -= QueuePeekCompleted;
         }
 
-        private static void QueuePeekCompleted(object sender, PeekCompletedEventArgs e)
+        private void QueuePeekCompleted(object sender, PeekCompletedEventArgs e)
         {
             var cmq = (MessageQueue)sender;
             cmq.EndPeek(e.AsyncResult);
@@ -256,41 +193,9 @@ namespace MiniBuss
             cmq.BeginPeek();
         }
 
-        private static void QueueReceiveCompleted(object sender, ReceiveCompletedEventArgs e)
+        private void HandleMessage(Message msg)
         {
-            var cmq = (MessageQueue)sender;
-
-            Message msg = null; //keep outside scope to move this to the error log 
-            try
-            {
-                msg = cmq.EndReceive(e.AsyncResult);
-                if (msg.AppSpecific == 0)
-                    HandleMessage(msg);
-                else
-                    HandleSubscribeAndUnsubscribeMessage(msg);
-
-            }
-            catch (Exception ex)
-            {
-                ConsoleError("Exception while receiving message: " + ex.Message);
-                if (msg != null)
-                    using (var scope = new TransactionScope())
-                    {
-                        using (var myQueue = new MessageQueue(cmq.MachineName + "\\" + cmq.QueueName + "_errors"))
-                        {
-                            myQueue.Send(msg, MessageQueueTransactionType.Automatic);
-                        }
-                        scope.Complete();
-                    }
-
-            }
-            cmq.Refresh();
-            cmq.BeginReceive();
-        }
-
-        private static void HandleMessage(Message msg)
-        {
-            var types = MessageHandlers.Select(h => h.Key).ToArray();
+            var types = _messageHandlers.Select(h => h.Key).ToArray();
 
             msg.Formatter = new XmlMessageFormatter(types);
             var message = msg.Body;
@@ -299,50 +204,56 @@ namespace MiniBuss
             if (HandleCorrelatedMessage(msg.CorrelationId, message)) return;
 
             var messageType = message.GetType();
-            var handler = MessageHandlers[messageType] as Action<object>; //will throw if no handler is found
+            var handler = _messageHandlers[messageType] as Action<object>; //will throw if no handler is found
 
             var replyQueueString = msg.ResponseQueue.MachineName + "\\" + msg.ResponseQueue.QueueName;
 
             if (msg.ResponseQueue != null)
             {
-                ReplyQueues.TryAdd(message.GetType().TypeHandle,
+                _replyQueues.TryAdd(message.GetType().TypeHandle,
                                       replyQueueString);
                 lock (messagesBeingHandled)
                     messagesBeingHandled[msg.Body] = msg.Id;
             }
 
             //execute the delegate for this message
-            if (handler != null) handler(message);
+            try
+            {
+                //OnBeforeHandle(message);
+                if (handler != null) handler(message);
+                //OnAfterHandle(message);
+            }
+            catch (Exception ex)
+            {
+                //OnErrorHandle(message, ex);
+                throw;
+            }
+
 
             if (msg.ResponseQueue != null)
             {
                 string rq;
-                var res = ReplyQueues.TryRemove(message.GetType().TypeHandle, out rq);
+                var res = _replyQueues.TryRemove(message.GetType().TypeHandle, out rq);
                 if (res == false) throw new Exception("Could not remove reply-queue, should not happen");
             }
         }
 
-
-
         public void Publish(object @event)
         {
             List<Subscription> subscriptions;
-            lock (Subscriptions)
+            lock (_subscriptions)
             {
-                subscriptions = Subscriptions.Where(s => s.Type == @event.GetType()).ToList();
+                subscriptions = _subscriptions.Where(s => s.Type == @event.GetType()).ToList();
             }
 
             Parallel.ForEach(subscriptions, subscription =>
                     {
                         var type = subscription.Type;
-                        if (type.Name == null) throw new Exception("Should not be possible");
-
                         var message = new Message { Body = @event, Recoverable = true, Label = type.Name };
 
                         //NOTE: Should published messages be removed if not handled? Easy to do with a TimeToBeReceived setting
                         //message.TimeToBeReceived = new TimeSpan(0,0,0,10);    //remove from queue after 10 secs
-                        var msgQ = new MessageQueue(subscription.SubscriberQueue);
-                        if (msgQ.Transactional)
+                        using (var msgQ = new MessageQueue(subscription.SubscriberQueue))
                         {
                             using (var mqt = new MessageQueueTransaction())
                             {
@@ -350,10 +261,6 @@ namespace MiniBuss
                                 msgQ.Send(message, mqt);
                                 mqt.Commit();
                             }
-                        }
-                        else
-                        {
-                            msgQ.Send(message);
                         }
                     });
         }
@@ -363,15 +270,15 @@ namespace MiniBuss
             var type = typeof(TEvent);
             if (type.Name == null) throw new Exception("Should not be possible");
 
-            if (!HandledSubscriptions.ContainsKey(type.Name))
-                HandledSubscriptions[type.Name] = type;
+            if (!_handledSubscriptions.ContainsKey(type.Name))
+                _handledSubscriptions[type.Name] = type;
         }
 
-        private static void HandleSubscribeAndUnsubscribeMessage(Message subscriptionMsg)
+        private void HandleSubscribeAndUnsubscribeMessage(Message subscriptionMsg)
         {
             var typestring = subscriptionMsg.Label; //label contains the message type name (no namespace, just class name)
 
-            var type = HandledSubscriptions[typestring];
+            var type = _handledSubscriptions[typestring];
 
             var subscriptionCommand = (SubscriptionCommand)subscriptionMsg.AppSpecific;
 
@@ -381,18 +288,18 @@ namespace MiniBuss
             {
                 case SubscriptionCommand.Start:
                     ConsoleInfo("Start sending events of type " + typestring + " to " + queue);
-                    lock (Subscriptions)
+                    lock (_subscriptions)
                     {
-                        if (!Subscriptions.Any(s => s.Type == type && s.SubscriberQueue == queue))
-                            Subscriptions.Add(new Subscription { Type = type, SubscriberQueue = queue });
+                        if (!_subscriptions.Any(s => s.Type == type && s.SubscriberQueue == queue))
+                            _subscriptions.Add(new Subscription { Type = type, SubscriberQueue = queue });
                     }
                     break;
                 case SubscriptionCommand.Stop:
                     ConsoleInfo("Stop sending events of type " + typestring + " to " + queue);
-                    lock (Subscriptions)
+                    lock (_subscriptions)
                     {
-                        if (Subscriptions.Any(s => s.Type == type && s.SubscriberQueue == queue))
-                            Subscriptions.Remove(Subscriptions.Where(s => s.Type == type && s.SubscriberQueue == (queue)).FirstOrDefault());
+                        if (_subscriptions.Any(s => s.Type == type && s.SubscriberQueue == queue))
+                            _subscriptions.Remove(_subscriptions.Where(s => s.Type == type && s.SubscriberQueue == (queue)).FirstOrDefault());
                     }
                     break;
             }
@@ -403,7 +310,7 @@ namespace MiniBuss
             var type = typeof(TEvent);
             if (type.Name == null) throw new Exception("Should not be possible");
 
-            MessageHandlers[typeof(TEvent)] = CastArgument<object, TEvent>(x => handler(x));
+            _messageHandlers[typeof(TEvent)] = CastArgument<object, TEvent>(x => handler(x));
 
             var message = new Message { AppSpecific = (int)SubscriptionCommand.Start, Recoverable = true, Label = type.Name };
             SendSubscribeMessage(GetEndpointName(publisherEndpoint), message);
@@ -425,18 +332,10 @@ namespace MiniBuss
 
             var responseQ = new MessageQueue(LocalEndpoint);
             message.ResponseQueue = responseQ;
-
-            if (msgQ.Transactional)
+            using (var tx = new TransactionScope())
             {
-                using (var tx = new TransactionScope())
-                {
-                    msgQ.Send(message, MessageQueueTransactionType.Automatic);
-                    tx.Complete();
-                }
-            }
-            else
-            {
-                msgQ.Send(message);
+                msgQ.Send(message, MessageQueueTransactionType.Automatic);
+                tx.Complete();
             }
         }
 
@@ -464,6 +363,79 @@ namespace MiniBuss
         {
             public Type Type { get; set; }
             public string SubscriberQueue { get; set; }
+        }
+    }
+
+    public partial class ServiceBus
+    {
+
+        private readonly IDictionary<string, BusAsyncResult> messageIdToAsyncResultLookup = new Dictionary<string, BusAsyncResult>();
+        private readonly IDictionary<object, string> messagesBeingHandled = new Dictionary<object, string>();
+
+        public ICallback SendWithCallback(object command)
+        {
+            return SendWithCallback(command, string.Empty);
+        }
+
+        public ICallback SendWithCallback(object command, string correlationId)
+        {
+            var targetQueue = _targetQueues[command.GetType().TypeHandle];
+            return SendMessageWithCallback(command, targetQueue, correlationId);
+        }
+
+        private ICallback SendMessageWithCallback(object msg, string targetQueue, string correlationId)
+        {
+            var type = msg.GetType();
+            if (type.Name == null) throw new Exception("Should not be possible");
+
+            var message = new Message { Body = msg, Recoverable = true, Label = type.Name };
+            var msgQ = new MessageQueue(targetQueue);
+
+            if (!string.IsNullOrEmpty(correlationId))
+                message.CorrelationId = correlationId;
+
+            if (LocalEndpoint != null)  //we expect and handle replies, so add a response-queue
+            {
+                var responseQ = new MessageQueue(LocalEndpoint);
+                message.ResponseQueue = responseQ;
+            }
+
+            using (var tx = new TransactionScope())
+            {
+                msgQ.Send(message, MessageQueueTransactionType.Automatic);
+                tx.Complete();
+            }
+
+            var result = new Callback(message.Id);
+            result.Registered += delegate(object sender, BusAsyncResultEventArgs args)
+            {
+                lock (messageIdToAsyncResultLookup)
+                    messageIdToAsyncResultLookup[args.MessageId] = args.Result;
+            };
+
+            return result;
+        }
+
+        private bool HandleCorrelatedMessage(string correlationId, object message)
+        {
+            if (string.IsNullOrEmpty(correlationId))
+                return false;
+
+            BusAsyncResult busAsyncResult;
+            Trace.TraceInformation("Handling correlated message");
+            lock (messageIdToAsyncResultLookup)
+            {
+                if (messageIdToAsyncResultLookup.TryGetValue(correlationId, out busAsyncResult))
+                    messageIdToAsyncResultLookup.Remove(correlationId);
+            }
+
+            if (busAsyncResult != null)
+            {
+                busAsyncResult.Complete(message);
+                var status = busAsyncResult.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5));
+                return status;
+            }
+            return false;
         }
     }
 }

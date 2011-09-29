@@ -29,6 +29,7 @@ namespace Receiver
 
             Console.WriteLine("Waiting for commands, press ENTER to exit");
             Console.ReadLine();
+            bus.Stop();
         }
     }
 
